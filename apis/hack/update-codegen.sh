@@ -25,9 +25,11 @@ set -o pipefail
 
 GO_CMD=${1:-go}
 CURRENT_DIR=$(dirname "${BASH_SOURCE[0]}")
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-CODEGEN_PKG=$($GO_CMD list -m -mod=readonly -f "{{.Dir}}" k8s.io/code-generator)
 cd "${CURRENT_DIR}/.."
+API_ROOT="$(pwd -P)"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+API_MODULE="$("${GO_CMD}" list -m -mod=readonly -f "{{.Path}}")"
+CODEGEN_PKG="$("${GO_CMD}" list -m -mod=readonly -f "{{.Dir}}" k8s.io/code-generator)"
 
 # shellcheck source=/dev/null
 source "${CODEGEN_PKG}/kube_codegen.sh"
@@ -37,12 +39,12 @@ crds='capacitybuffer capacityquota provisioningrequest'
 for crd in $crds
 do
   kube::codegen::gen_client \
-    --output-pkg "k8s.io/autoscaler/cluster-autoscaler/apis/$crd/client" \
-    --output-dir "${REPO_ROOT}/cluster-autoscaler/apis/$crd/client" \
+    --output-pkg "${API_MODULE}/$crd/client" \
+    --output-dir "${API_ROOT}/$crd/client" \
     --boilerplate "${REPO_ROOT}/hack/boilerplate/boilerplate.generatego.txt" \
     --with-watch \
     --with-applyconfig \
-    "${REPO_ROOT}/cluster-autoscaler/apis/$crd"
+    "${API_ROOT}/$crd"
 done
 
 # We need to clean up the go.mod file since code-generator adds temporary library to the go.mod file.

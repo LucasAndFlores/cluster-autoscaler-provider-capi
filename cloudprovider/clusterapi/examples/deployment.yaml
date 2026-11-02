@@ -20,7 +20,7 @@ spec:
       - image: ${AUTOSCALER_IMAGE}
         name: cluster-autoscaler
         command:
-        - /cluster-autoscaler
+        - /cluster-autoscaler-provider-capi
         args:
         - --cloud-provider=clusterapi
       serviceAccountName: cluster-autoscaler

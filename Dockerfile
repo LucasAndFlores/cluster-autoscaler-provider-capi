@@ -31,15 +31,13 @@ ARG BUILD_TAGS
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    if [ -n "$BUILD_TAGS" ]; then \
-        CGO_ENABLED=0 GOOS=linux go build -o cluster-autoscaler-$GOARCH -ldflags="$LDFLAGS" -tags="$BUILD_TAGS"; \
-    else \
-        CGO_ENABLED=0 GOOS=linux go build -o cluster-autoscaler-$GOARCH -ldflags="$LDFLAGS"; \
-    fi
+    CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build \
+        -o cluster-autoscaler-provider-capi-$GOARCH \
+        -ldflags="$LDFLAGS" -tags="$BUILD_TAGS"
 
 FROM gcr.io/distroless/static:nonroot
 ARG GOARCH
-COPY --from=builder /workspace/cluster-autoscaler-$GOARCH /cluster-autoscaler
+COPY --from=builder /workspace/cluster-autoscaler-provider-capi-$GOARCH /cluster-autoscaler-provider-capi
 
 WORKDIR /
-CMD ["/cluster-autoscaler"]
+CMD ["/cluster-autoscaler-provider-capi"]
