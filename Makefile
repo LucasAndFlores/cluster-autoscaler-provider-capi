@@ -1,20 +1,24 @@
 ALL_ARCH = amd64 arm64 s390x
-all: $(addprefix build-arch-,$(ALL_ARCH))
+.PHONY: all help build test-unit test-ci benchmark clean generate manifests \
+	fmt fmt-check format make-image push-image push-manifest dev-release \
+	execute-release release-validate release build-in-docker container test-in-docker
+all: $(addprefix build-arch-,$(ALL_ARCH)) ## Build binaries for all supported architectures.
 
-GO_TEST_DEFAULT_ANALYZERS?=all
-GO_TEST_EXCLUDE_REGEX?=/cloudprovider/oci/vendor-internal/
-TAG?=dev
-FLAGS=
-LDFLAGS?=-s
-ENVVAR=CGO_ENABLED=0
-GOOS?=linux
-GOARCH?=$(shell go env GOARCH)
-REGISTRY?=gcr.io/k8s-staging-autoscaling
-DOCKER_NETWORK?=default
-SUPPORTED_BUILD_TAGS=$(shell ls cloudprovider/router/ | grep -e '^router_.*\.go' | sed 's/router_\(.*\)\.go/\1/')
+GO_TEST_DEFAULT_ANALYZERS ?= all
+# Local unit-test packages; cluster-dependent e2e tests are run separately.
+UNIT_TEST_PACKAGES ?= . ./cloudprovider/... ./version/...
+TAG ?= dev
+LDFLAGS ?= -s
+ENVVAR = CGO_ENABLED=0
+GOOS ?= linux
+GOARCH ?= $(shell go env GOARCH)
+BINARY_NAME := cluster-autoscaler-provider-capi
+REGISTRY ?= gcr.io/k8s-staging-autoscaling
+DOCKER_NETWORK ?= default
+GO_IMAGE ?= golang:1.26
 
-# VERSION is the cluster-autoscaler version baked into the binary via -ldflags.
-#   1. Exact git tag pointing at HEAD, with the "cluster-autoscaler-" prefix stripped.
+# VERSION is the cluster-autoscaler-provider-capi version baked into the binary via -ldflags.
+#   1. Exact git tag pointing at HEAD, with the "cluster-autoscaler-provider-capi-" prefix stripped.
 #   2. The current commit SHA.
 #   3. The literal string "dev" (for builds outside a git checkout).
 # A "-dirty" suffix is appended when the git working tree has uncommitted
@@ -22,7 +26,7 @@ SUPPORTED_BUILD_TAGS=$(shell ls cloudprovider/router/ | grep -e '^router_.*\.go'
 # Override with `make VERSION=<value> ...` to force a specific value; an
 # externally provided VERSION is used verbatim, with no "-dirty" suffix.
 ifeq ($(origin VERSION),undefined)
-  VERSION := $(shell git describe --exact-match --tags 2>/dev/null | sed -e 's|^cluster-autoscaler-||')
+  VERSION := $(shell git describe --exact-match --tags 2>/dev/null | sed -e 's|^$(BINARY_NAME)-||')
   ifeq ($(strip $(VERSION)),)
     VERSION := $(shell git rev-parse HEAD 2>/dev/null)
   endif
@@ -38,168 +42,120 @@ VERSION_LDFLAG := -X $(VERSION_PKG).ClusterAutoscalerVersion=$(VERSION)
 LDFLAGS_VALUE := $(strip $(LDFLAGS) $(VERSION_LDFLAG))
 
 ifdef BUILD_TAGS
-  TAGS_FLAG=--tags ${BUILD_TAGS}
-  PROVIDER=-${BUILD_TAGS}
-  FOR_PROVIDER=" for ${BUILD_TAGS}"
+  TAGS_FLAG = --tags $(BUILD_TAGS)
+  PROVIDER = -$(BUILD_TAGS)
 else
-  TAGS_FLAG=
-  PROVIDER=
-  FOR_PROVIDER=
+  TAGS_FLAG =
+  PROVIDER =
 endif
-LDFLAGS_FLAG=--ldflags="${LDFLAGS_VALUE}"
-ifdef DOCKER_RM
-  RM_FLAG=--rm
-else
-  RM_FLAG=
-endif
-ifndef AWS_REGION
-  AWS_REGION=$(shell aws configure get region)
-endif
+FOR_PROVIDER = $(if $(BUILD_TAGS), for $(BUILD_TAGS))
+LDFLAGS_FLAG = --ldflags="$(LDFLAGS_VALUE)"
 
-IMAGE=$(REGISTRY)/cluster-autoscaler$(PROVIDER)
+IMAGE = $(REGISTRY)/$(BINARY_NAME)$(PROVIDER)
+IMAGE_BUILD_ARGS = --pull --platform linux/$* --network="$(DOCKER_NETWORK)" \
+	--build-arg "GOARCH=$*" \
+	--build-arg 'LDFLAGS=$(LDFLAGS_VALUE)' \
+	--build-arg 'BUILD_TAGS=$(BUILD_TAGS)' \
+	-t $(IMAGE)-$*:$(TAG) -f Dockerfile .
 
-export DOCKER_CLI_EXPERIMENTAL := enabled
+help: ## List available Makefile targets.
+	@awk 'BEGIN { FS = ":.*## "; printf "Available targets:\n" } /^[[:alnum:]_-]+:.*## / { printf "  %-20s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-build:
+build: ## Build a binary for the current architecture (override with GOARCH).
 	@$(MAKE) build-arch-$(GOARCH)
 
-build-arch-%: clean-arch-%
-	$(ENVVAR) GOOS=$(GOOS) GOARCH=$* go build -o cluster-autoscaler-$* ${LDFLAGS_FLAG} ${TAGS_FLAG}
+build-arch-%: ## Build a binary for the architecture specified by the target suffix.
+	$(ENVVAR) GOOS=$(GOOS) GOARCH=$* go build -o $(BINARY_NAME)-$* $(LDFLAGS_FLAG) $(TAGS_FLAG)
 
-test-build-tags:
-	@if [ -z "$(SUPPORTED_BUILD_TAGS)" ]; then \
-		echo "No supported build tags found"; \
-		exit 1; \
-	fi
-	@for tag in $(SUPPORTED_BUILD_TAGS); do \
-		echo "Testing build with tag $$tag"; \
-		BUILD_TAGS=$$tag $(MAKE) build || exit 1; \
-	done
+test-unit: ## Run race-enabled unit tests and checks in both Go modules.
+	go test -race -vet="$(GO_TEST_DEFAULT_ANALYZERS)" $(TAGS_FLAG) $(UNIT_TEST_PACKAGES)
+	go -C apis test -race -vet="$(GO_TEST_DEFAULT_ANALYZERS)" $(TAGS_FLAG) ./...
 
-test-unit: clean build
-	go test -race $$(go list ./... | grep -v ${GO_TEST_EXCLUDE_REGEX} ) -vet="${GO_TEST_DEFAULT_ANALYZERS}" ${TAGS_FLAG}
+test-ci: test-unit ## Run the same unit-test checks in CI.
 
-test-controllers: setup-envtest clean build
-	ginkgo --race --vet="${GO_TEST_DEFAULT_ANALYZERS}" ${TAGS_FLAG} ./test/integration/controllers/...
+benchmark: ## Run benchmarks in both Go modules without running tests.
+	go test -bench=. -run='^$$' -vet="$(GO_TEST_DEFAULT_ANALYZERS)" $(TAGS_FLAG) $(UNIT_TEST_PACKAGES)
+	go -C apis test -bench=. -run='^$$' -vet="$(GO_TEST_DEFAULT_ANALYZERS)" $(TAGS_FLAG) ./...
 
-test-ci: setup-envtest
-	go test -race $$(go list ./... | grep -v ${GO_TEST_EXCLUDE_REGEX} ) -vet="${GO_TEST_DEFAULT_ANALYZERS}" ${TAGS_FLAG}
+dev-release: dev-release-arch-$(GOARCH) ## Build and interactively publish the current-architecture image.
 
-benchmark:
-	go test $$(go list ./... | grep -v ${GO_TEST_EXCLUDE_REGEX} ) -bench=. -run='^$$' -vet="${GO_TEST_DEFAULT_ANALYZERS}"
-
-dev-release: dev-release-arch-$(GOARCH)
-
-dev-release-arch-%: build-arch-% make-image-arch-% push-image-arch-%
+dev-release-arch-%: make-image-arch-%
+	$(MAKE) push-image-arch-$*
 	@echo "Release ${TAG}${FOR_PROVIDER}-$* completed"
 
-make-image: make-image-arch-$(GOARCH)
+make-image: make-image-arch-$(GOARCH) ## Build and load an image for the current architecture.
 
 make-image-arch-%:
-	GOOS=$(GOOS) docker buildx build --pull --platform linux/$* \
-		--build-arg "GOARCH=$*" \
-		--build-arg 'LDFLAGS=${LDFLAGS_VALUE}' \
-		--build-arg 'BUILD_TAGS=${BUILD_TAGS}' \
-		-t ${IMAGE}-$*:${TAG} \
-		-f Dockerfile .
+	docker buildx build --load $(IMAGE_BUILD_ARGS)
 	@echo "Image ${TAG}${FOR_PROVIDER}-$* completed"
 
-push-image: push-image-arch-$(GOARCH)
+push-image: push-image-arch-$(GOARCH) ## Interactively publish an existing current-architecture image.
 
 push-image-arch-%:
 	./push_image.sh ${IMAGE}-$*:${TAG}
 
+# Publish single-platform manifests for docker manifest create.
 push-release-image-arch-%:
-	docker push ${IMAGE}-$*:${TAG}
+	docker buildx build --push --provenance=false $(IMAGE_BUILD_ARGS)
 
-push-manifest:
+push-manifest: ## Publish a manifest for existing architecture images.
 	docker manifest create ${IMAGE}:${TAG} \
-	    $(addprefix $(REGISTRY)/cluster-autoscaler$(PROVIDER)-, $(addsuffix :$(TAG), $(ALL_ARCH)))
+	    $(addprefix $(IMAGE)-, $(addsuffix :$(TAG), $(ALL_ARCH)))
 	docker manifest push --purge ${IMAGE}:${TAG}
 
-execute-release: $(addprefix make-image-arch-,$(ALL_ARCH)) $(addprefix push-release-image-arch-,$(ALL_ARCH)) push-manifest
+execute-release: $(addprefix push-release-image-arch-,$(ALL_ARCH)) ## Publish architecture images, then the multi-architecture manifest.
+	$(MAKE) push-manifest
 	@echo "Release ${TAG}${FOR_PROVIDER} completed"
 
-clean: clean-arch-$(GOARCH)
+clean: clean-arch-$(GOARCH) ## Remove the current-architecture binary (override with GOARCH).
 
 clean-arch-%:
-	rm -f cluster-autoscaler-$*
+	rm -f $(BINARY_NAME)-$*
 
-generate:
-	AWS_REGION=$(AWS_REGION) go generate ./cloudprovider/aws
+generate: ## Generate API deepcopy implementations.
+	$(MAKE) -C apis generate
 
-format:
-	test -z "$$(find . -path ./vendor -prune -type f -o -name '*.go' -exec gofmt -s -d {} + | tee /dev/stderr)" || \
-	test -z "$$(find . -path ./vendor -prune -type f -o -name '*.go' -exec gofmt -s -w {} + | tee /dev/stderr)"
+manifests: ## Generate API CRD, RBAC, and webhook manifests.
+	$(MAKE) -C apis manifests
 
-docker-builder:
-	docker build --network=${DOCKER_NETWORK} -t autoscaling-builder ../builder
+fmt: ## Format Go files in both modules.
+	find . -type d \( -name .git -o -name vendor -o -name bin \) -prune -o -type f -name '*.go' -exec gofmt -s -w {} +
 
-build-in-docker: build-in-docker-arch-$(GOARCH)
+fmt-check: ## Check Go formatting in both modules without changing files.
+	@files="$$(find . -type d \( -name .git -o -name vendor -o -name bin \) -prune -o -type f -name '*.go' -exec gofmt -s -l {} +)" || exit $$?; \
+	if [ -n "$$files" ]; then \
+		printf 'Go files requiring formatting:\n%s\n' "$$files" >&2; \
+		exit 1; \
+	fi
 
-build-in-docker-arch-%: clean-arch-% docker-builder
-	docker run ${RM_FLAG} -v `pwd`:/gopath/src/k8s.io/autoscaler/cluster-autoscaler/:Z autoscaling-builder:latest \
-		bash -c 'cd /gopath/src/k8s.io/autoscaler/cluster-autoscaler && BUILD_TAGS=${BUILD_TAGS} LDFLAGS="${LDFLAGS}" make build-arch-$*'
+format: fmt ## Alias for fmt.
 
-release-extract-version = $(VERSION)
+build-in-docker: build-in-docker-arch-$(GOARCH) ## Build a binary using the Go container image.
 
-release-validate:
-	@if [ -z "$(shell git tag --points-at HEAD | grep -Fx 'cluster-autoscaler-$(VERSION)')" ]; then \
+build-in-docker-arch-%:
+	docker run --rm -v "$(CURDIR):/workspace:Z" -w /workspace "$(GO_IMAGE)" \
+		make build-arch-$* GOOS="$(GOOS)" VERSION="$(VERSION)" \
+		LDFLAGS="$(LDFLAGS)" BUILD_TAGS="$(BUILD_TAGS)" \
+		BINARY_NAME="$(BINARY_NAME)" ENVVAR="$(ENVVAR)"
+
+release-validate: ## Check that VERSION matches a release tag at HEAD.
+	@if [ -z "$(shell git tag --points-at HEAD | grep -Fx '$(BINARY_NAME)-$(VERSION)')" ]; then \
 		echo "Can't release: VERSION=$(VERSION) does not match a git tag at HEAD"; \
 		exit 1; \
 	fi
 
-release: TAG=v$(call release-extract-version)
-release: release-validate $(addprefix build-in-docker-arch-,$(ALL_ARCH)) execute-release
+release: TAG = v$(VERSION)
+release: release-validate ## Validate the release tag before publishing images.
+	$(MAKE) execute-release TAG="$(TAG)" VERSION="$(VERSION)"
 	@echo "Full in-docker release ${TAG}${FOR_PROVIDER} completed"
 
-container: container-arch-$(GOARCH)
+container: container-arch-$(GOARCH) ## Build and load an image using the multistage Dockerfile.
 
-container-arch-%: build-in-docker-arch-% make-image-arch-%
+container-arch-%: make-image-arch-%
 	@echo "Full in-docker image ${TAG}${FOR_PROVIDER}-$* completed"
 
-test-in-docker: clean docker-builder
-	docker run ${RM_FLAG} -v `pwd`:/cluster-autoscaler/:Z autoscaling-builder:latest bash -c 'cd /cluster-autoscaler && go test -race $$(go list ./... | grep -v ${GO_TEST_EXCLUDE_REGEX} ) -vet="${GO_TEST_DEFAULT_ANALYZERS}" ${TAGS_FLAG}'
-
-## Location to install dependencies to
-LOCALBIN ?= $(shell pwd)/bin
-$(LOCALBIN):
-	mkdir -p $(LOCALBIN)
-
-ENVTEST ?= $(LOCALBIN)/setup-envtest
-#ENVTEST_VERSION is the version of controller-runtime release branch to fetch the envtest setup script (i.e. release-0.20)
-ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller-runtime | awk -F'[v.]' '{printf "release-%d.%d", $$2, $$3}')
-#ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
-ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
-
-
-.PHONY: setup-envtest
-setup-envtest: envtest ## Download the binaries required for ENVTEST in the local bin directory.
-	@echo "Setting up envtest binaries for Kubernetes version $(ENVTEST_K8S_VERSION)..."
-	@$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path || { \
-		echo "Error: Failed to set up envtest binaries for version $(ENVTEST_K8S_VERSION)."; \
-		exit 1; \
-	}
-
-.PHONY: envtest
-envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
-$(ENVTEST): $(LOCALBIN)
-	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
-
-# go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
-# $1 - target path with name of binary
-# $2 - package url which can be installed
-# $3 - specific version of package
-define go-install-tool
-@[ -f "$(1)-$(3)" ] || { \
-set -e; \
-package=$(2)@$(3) ;\
-echo "Downloading $${package}" ;\
-rm -f $(1) || true ;\
-GOBIN=$(LOCALBIN) go install $${package} ;\
-mv $(1) $(1)-$(3) ;\
-} ;\
-ln -sf $(1)-$(3) $(1)
-endef
-
-.PHONY: all build test-unit clean format execute-release dev-release docker-builder build-in-docker release generate push-image push-manifest
+test-in-docker: ## Run both-module unit tests using the Go container image.
+	docker run --rm -v "$(CURDIR):/workspace:Z" -w /workspace "$(GO_IMAGE)" \
+		make test-unit VERSION="$(VERSION)" \
+		GO_TEST_DEFAULT_ANALYZERS="$(GO_TEST_DEFAULT_ANALYZERS)" \
+		BUILD_TAGS="$(BUILD_TAGS)" UNIT_TEST_PACKAGES="$(UNIT_TEST_PACKAGES)"

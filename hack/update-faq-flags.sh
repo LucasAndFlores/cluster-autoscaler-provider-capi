@@ -15,7 +15,7 @@
 # limitations under the License.
 
 ###
-# This script get flags from cluster-autoscaler and generate new flags table
+# This script gets flags from cluster-autoscaler-provider-capi and generates a new flags table.
 ###
 
 set -o errexit
@@ -36,17 +36,17 @@ function get_grep_command() {
 }
 
 GREP_CMD="$(get_grep_command)"
-SCRIPT_ROOT=$(realpath $(dirname "${BASH_SOURCE[0]}"))/..
-AUTOSCALER="${SCRIPT_ROOT}/cluster-autoscaler-$(go env GOARCH)"
+SCRIPT_ROOT="$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")"
+AUTOSCALER="${SCRIPT_ROOT}/cluster-autoscaler-provider-capi-$(go env GOARCH)"
 TARGET_FILE="${SCRIPT_ROOT}/FAQ.md"
 
 pushd "${SCRIPT_ROOT}" >/dev/null
 [ -e "${AUTOSCALER}" ] || make build
 popd >/dev/null
 
-# Get flags from `cluster-autoscaler -h` stderr output
+# Get flags from `cluster-autoscaler-provider-capi --help` output.
 set +e
-HELP_OUTPUT=$($AUTOSCALER --help 2>&1 | $GREP_CMD -Ev '(^$|^Usage|^pflag|--ginkgo)')
+HELP_OUTPUT=$("$AUTOSCALER" --help 2>&1 | $GREP_CMD -Ev '(^$|^Usage|^pflag|--ginkgo)')
 set -e
 FLAGS=$(echo "${HELP_OUTPUT}" | awk '
     /^[[:space:]]*--/ { print; next }
